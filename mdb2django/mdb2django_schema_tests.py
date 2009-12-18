@@ -1,12 +1,48 @@
 from nose.tools import eq_, assert_true, assert_false, assert_raises
 
 from mdb2django_schema import (
+    java2python,
     forloop,
     camelcase2english,
     Relationship,
     DatabaseWrapper,
     Model,
     Field)
+
+try: # jython
+    import java
+except ImportError: # JPype
+    from jpype import startJVM, getDefaultJVMPath, JPackage, JClass, java
+    startJVM(getDefaultJVMPath())
+    com = JPackage('com')
+
+class Java2Python_Tests:
+    def setUp(self):
+        try: # jython
+            from java.lang import Integer, Short, Boolean
+            from java.util import Date
+        except ImportError: # JPype
+            global Integer, Short, Boolean, Date
+            Integer = java.lang.Integer
+            Short = java.lang.Short
+            Boolean = java.lang.Boolean
+            Date = java.util.Date
+
+    def test_integer(self):
+        eq_(java2python(Integer(23)), 23)
+
+    def test_short(self):
+        eq_(java2python(Short(23)), 23)
+
+    def test_boolean_false(self):
+        eq_(java2python(Boolean(False)), False)
+
+    def test_boolean_True(self):
+        eq_(java2python(Boolean(True)), True)
+
+    def test_date(self):
+        eq_(java2python(Date(0, 0, 0, 0, 50, 0)), u'1899-12-31 00:50:00')
+        eq_(java2python(Date(109, 11, 10, 13, 59, 15)), u'2009-12-10 13:59:15')
 
 class ForLoop_Tests:
     def test_empty_sequence(self):
@@ -47,6 +83,10 @@ class CamelCaseToEnglish_Tests:
         eq_(camelcase2english('SeparatesMultipleWordsToo'),
             'Separates Multiple Words Too')
 
+    def test_separates_two_words_lowercase_first(self):
+        eq_(camelcase2english('twoWords'),
+            'Two Words')
+
 class Mock(object):
     def __init__(self, **kwargs):
         for attname, value in kwargs.iteritems():
@@ -68,16 +108,18 @@ class DatabaseMock(Mock):
         return c
 
 class ExampleDatabaseMock(DatabaseMock):
-    reporter_table = TableMock('Reporter', [Mock(name='id')])
-    article_table = TableMock('Article', [Mock(name='reporter_id')])
+    reporter_id = Mock(name='id')
+    reporter_table = TableMock('Reporter', [reporter_id])
+    article_reporter = Mock(name='reporter_id')
+    article_table = TableMock('Article', [article_reporter])
     newspaper_table = TableMock('Newspaper')
     publisher_table = TableMock('Publisher')
 
     _reporter_article_relationship = Mock(
         toTable=article_table,
-        toColumns=[Mock(name='reporter_id')],
+        toColumns=[article_reporter],
         fromTable=reporter_table,
-        fromColumns=[Mock(name='id')],
+        fromColumns=[reporter_id],
         leftOuterJoin=False,
         rightOuterJoin=False,
         oneToOne=False)
@@ -103,7 +145,7 @@ def test_relationship():
         toColumns=['to_column'], fromColumns=['from_column'])
 
     class ModelMock(Mock):
-        def get_field_for_column(self, column):
+        def get_field_by_column(self, column):
             return '%s.%s' % (self.name, column.replace('column', 'field'))
 
     models = {'to_table': ModelMock(name='to_model'),
@@ -174,25 +216,31 @@ class Model_Tests:
         eq_(m.single_column_indexes, {'reporter_id': index})
 
     def test_fields(self):
-        table = TableMock('Article', [Mock(name='id'),
+        table = TableMock('Article', [Mock(name='title'),
                                       Mock(name='reporter')])
         article_model = Model(DatabaseMock(), table)
-        eq_([repr(f) for f in article_model.fields],
-            ['<Field Article.id>', '<Field Article.reporter>'])
+        eq_([(f.__class__.__name__, f.name) for f in article_model.fields],
+            [('PrimaryKeyField', 'id'),
+             ('Field', 'title'),
+             ('Field', 'reporter')])
 
     def test_foreign_keys(self):
-        db = Mock(relationships={})
-        table = TableMock('Article', [Mock(name='id'),
+        db = DatabaseMock(relationships={})
+        table = TableMock('Article', [Mock(name='title'),
                                       Mock(name='reporter')])
+        # an AutoField primary key will be automatically created as
+        # field #0
         article_model = Model(db, table)
-        db.relationships[article_model.fields[1]] = 'the only foreign key'
+        db.relationships[article_model.fields[2]] = 'the only foreign key'
+        assert_true(article_model.fields[2] in db.relationships)
+        assert_true(article_model.fields[2].foreign_key)
         eq_(list(article_model.foreign_keys), ['the only foreign key'])
 
     def test_inlines_as_python(self):
-        table = TableMock('Article', [Mock(name='id')], indexes=[])
+        table = TableMock('Article', [Mock(name='code')], indexes=[])
         database = DatabaseMock(relationships={})
         article_model = Model(database, table)
-        database.relationships[article_model.fields[0]] = (
+        database.relationships[article_model.fields[1]] = (
             Mock(to_field=Mock(name='article',
                                inline_class_name='ArticleInline')))
         eq_(list(article_model.inlines_as_python()), [
@@ -201,10 +249,10 @@ class Model_Tests:
                 '    model = Article'])
 
     def test_inline_class_names_without_field_names(self):
-        db = Mock(reverse_relationships={})
+        db = DatabaseMock(reverse_relationships={})
         reporter_model = Model(
-            db, TableMock('Reporter', [Mock(name='id')]))
-        db.reverse_relationships[reporter_model.fields[0]] = [
+            db, TableMock('Reporter', [Mock(name='code')]))
+        db.reverse_relationships[reporter_model.fields[1]] = [
             Mock(to_field=Mock(inline_class_name='ArticleInline')),
             Mock(to_field=Mock(inline_class_name='OtherInline'))]
         eq_(list(reporter_model.inline_class_names),
@@ -213,10 +261,10 @@ class Model_Tests:
 class DatabaseWrapper_Tests:
     def test_add_relationships(self):
         d = DatabaseWrapper(ExampleDatabaseMock())
-        d._relationships = {'all': {}}
-        d._add_relationships(['Reporter', 'Article'])
+        relationships = {'all': {}}
+        d._add_relationships(relationships, ['Reporter', 'Article'])
         key = 'Article', 'reporter_id'
-        r = d.get_relationships()['all']
+        r = relationships['all']
         eq_([[f.name for f in key] for key in r.keys()],
             [['reporter_id', 'id']])
         eq_([(rs.to_field.name, rs.from_field.name) for rs in r.values()],
