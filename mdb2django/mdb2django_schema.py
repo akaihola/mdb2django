@@ -76,7 +76,7 @@ class ValueConversion:
         python_value = self.java2python(table_name, column_name, value)
         if python_value is None:
             return 'null'
-        return value
+        return python_value
 
     def java2pgcopy(self, table_name, column_name, value):
         """Format a Java column value as a PostgreSQL COPY command column value
@@ -240,8 +240,6 @@ class PrimaryKeyField:
     """
     name = 'id'
     primary_key = True
-    #field_class = 'AutoField'
-    #attrs = ()
     class column:
         name = None
     foreign_key = False
@@ -250,10 +248,6 @@ class PrimaryKeyField:
         pass
     def as_python(self):
         return ()
-    #class type:
-    #    @classmethod
-    #    def name(cls):
-    #        return u'LONG'
 
 class Model:
     def __init__(self, database, access_table):
@@ -380,7 +374,7 @@ class Model:
         return (fk.to_field.inline_class_name
                 for fk in self.reverse_foreign_keys)
 
-    def admin_as_python(self):
+    def output_admin(self):
         yield ''
         yield 'admin.site.register('
         yield '    %s,' % self.name
@@ -400,11 +394,16 @@ class Model:
                     yield '        %s])' % inline_name
 
     def get_rows(self):
+        self.access_table.reset()
         row_generator = (self.access_table.getNextRow()
                          for i in itertools.repeat(None))
         return itertools.takewhile(lambda row: row is not None, row_generator)
 
-    def fixture_as_json(self, app_name, valueconversion):
+    @property
+    def row_count(self):
+        return self.access_table.getRowCount()
+
+    def output_fixture(self, app_name, valueconversion):
         "Output all rows from the model table as JSON"
         # helper function for converting Jackcess column values to
         # JSON:
@@ -443,7 +442,7 @@ class Model:
     def delete_as_pg(self):
         return 'DELETE FROM %s;' % self.pg_table
 
-    def data_as_pg(self, valueconversion):
+    def output_postgresql(self, valueconversion):
         "Output all rows from the table as PostgreSQL COPY commands"
         # get fields in MDB order, exclude added AutoFields
         column_names = [column.name
@@ -462,7 +461,33 @@ class Model:
     def __repr__(self):
         return '<Model %s>' % self.name
 
+class OutputType(object):
+    def __init__(self, name, title, comment_char, work):
+        self.name = name
+        self.title = title
+        self.comment_char = comment_char
+        self.work = work
+
+    @property
+    def attr(self):
+        return '%s_file' % self.name
+
+    @property
+    def long(self):
+        return '--%s-file' % self.name
+
+    @property
+    def method_name(self):
+        return 'output_%s' % self.name
+
 class DatabaseWrapper:
+
+    OUTPUT_TYPES = [
+        OutputType('models', 'models.py', '#', 5.0),
+        OutputType('admin', 'admin.py', '#', 1.0),
+        OutputType('fixture', 'fixture.json', '#', 150.0),
+        OutputType('postgresql', 'pg_data.sql', '-', 40.0)]
+
     def __init__(self, db,
                  app_name='myapp',
                  schema=None,
@@ -565,41 +590,61 @@ class DatabaseWrapper:
     def ordered_models(self):
         return list(self.order_models(self.models))
 
-    def models_as_python(self):
+    def output_models(self):
+        yield len(self.models) + 2, 'generating model imports'
         yield 'from django.db import models'
         yield 'from django.utils.translation import ugettext as _'
-        for line in self.ordered_models:
-            yield line
+        for index, model in enumerate(self.ordered_models):
+            yield len(self.models) - index, 'generating models: %s' % model.name
+            for line in model.as_python():
+                yield line
 
-    def admin_as_python(self):
+    def output_admin(self):
+        yield 2 * len(self.models) + 2, 'generating admin imports'
         yield 'from django.contrib import admin'
         yield 'from %s.models import (' % self.app_name
-        for model in self.ordered_models:
+        for index, model in enumerate(self.ordered_models):
+            yield 2 * len(self.models) + 1, 'generating admin model imports'
             yield '    %s,' % model.name
         yield ')'
-        for model in self.ordered_models:
+        for index, model in enumerate(self.ordered_models):
+            yield (2 * len(self.models) - index,
+                   'generating admin inline: %s', model.name)
             for line in model.inlines_as_python():
                 yield line
-        for model in self.ordered_models:
-            for line in model.admin_as_python():
+        for index, model in enumerate(self.ordered_models):
+            yield (len(self.models) - index,
+                   'generating ModelAdmin: %s' % model.name)
+            for line in model.output_admin():
                 yield line
 
-    def fixture_as_json(self):
+    def total_data_lines(self):
+        return sum((model.row_count for model in self.models), 0)
+
+    def output_fixture(self):
         "Output all data from the database as a JSON fixture"
+        total = self.total_data_lines()
         for model_is_first, model, model_is_last in forloop(self.models):
-            lines = forloop(model.fixture_as_json(self.app_name,
-                                                  self.valueconversion))
+            lines = forloop(model.output_fixture(
+                    self.app_name, self.valueconversion))
             for line_is_first, line, line_is_last in lines:
+                yield total, 'generating JSON fixture: %s' % model.name
+                total -= 1
                 yield (' ['[model_is_first and line_is_first] +
                        line +
                        ('', ']')[model_is_last and line_is_last])
 
-    def data_as_pg(self):
+    def output_postgresql(self):
         "Output all data from the database as PostgreSQL COPY commands"
+        counter = len(self.models) + self.total_data_lines()
         for model in reversed(self.ordered_models):
+            yield counter, 'generating SQL DELETE clauses: %s' % model.name
+            counter -= 1
             yield model.delete_as_pg()
         for model in self.ordered_models:
-            for line in model.data_as_pg(self.valueconversion):
+            for line in model.output_postgresql(self.valueconversion):
+                yield counter, 'generating SQL COPY lines: %s' % model.name
+                counter -= 1
                 yield line
 
     def __repr__(self):
@@ -608,13 +653,14 @@ class DatabaseWrapper:
 def make_option_parser():
     from optparse import OptionParser
     p = OptionParser()
-    p.add_option('-m', '--models-file', action='store')
-    p.add_option('-a', '--admin-file', action='store')
-    p.add_option('-f', '--fixture-file', action='store')
-    p.add_option('-p', '--postgresql-file', action='store')
+    for output_type in DatabaseWrapper.OUTPUT_TYPES:
+        p.add_option('-%s' % output_type.name[0],
+                     output_type.long,
+                     action='store')
     p.add_option('-n', '--app-name', action='store', default='myapp')
     p.add_option('-s', '--schema', action='store')
     p.add_option('-k', '--keep-table-names', action='store_true')
+    p.add_option('-P', '--progress', action='store_true')
     p.add_option('-d', '--debug', action='store')
     return p
 
@@ -634,43 +680,57 @@ def make_database_wrapper(opts, args,
                                      column2field_name=column2field_name,
                                      custom_conversion=custom_conversion)
 
-def write_to_file_or_stdout(line_generator, filepath, title, use_stdout,
+def write_to_file_or_stdout(line_generator, filepath, title, progress_callback,
                             comment_char='#'):
-    if filepath and filepath != '-':
-        output = file(filepath, 'w')
-    elif use_stdout or filepath == '-':
+    if filepath is None:
+        return None
+    if filepath == '-':
         output = sys.stdout
         output.write('\n\n%s %s %s\n\n' % ((68-len(title)) * comment_char,
                                            title,
                                            2*comment_char))
     else:
-        return None
-    for line in line_generator():
-        print >>output, line
+        output = file(filepath, 'w')
+    lines = line_generator()
+    total_estimate = None
+    for item in lines:
+        if isinstance(item, (str, unicode)):
+            print >>output, item
+        elif progress_callback:
+            # `item` is tuple (number of lines remaining, message)
+            if total_estimate is None:
+                total_estimate = float(item[0])
+            progress_callback(1.0 - (item[0] / total_estimate), item[1])
 
 def run_conversion(dbwrapper, opts):
-    use_stdout = not ( opts.models_file or
-                       opts.admin_file or
-                       opts.fixture_file or
-                       opts.postgresql_file )
+    total_work = sum((t.work for t in dbwrapper.OUTPUT_TYPES
+                      if getattr(opts, t.attr) is not None),
+                     0.0)
+    work_offset = 0.0
+    for output_type in dbwrapper.OUTPUT_TYPES:
+        filepath = getattr(opts, output_type.attr)
+        if filepath is None:
+            continue
 
-    write_to_file_or_stdout(dbwrapper.models_as_python,
-                            opts.models_file,
-                            'models.py',
-                            use_stdout)
-    write_to_file_or_stdout(dbwrapper.admin_as_python,
-                            opts.admin_file,
-                            'admin.py',
-                            use_stdout)
-    write_to_file_or_stdout(dbwrapper.fixture_as_json,
-                            opts.fixture_file,
-                            'fixture.json',
-                            use_stdout)
-    write_to_file_or_stdout(dbwrapper.data_as_pg,
-                            opts.postgresql_file,
-                            'fixture.sql',
-                            use_stdout,
-                            comment_char='-')
+        if opts.progress:
+            def progress_callback(progress, message):
+                progress = max(0.0, min(100.0, progress))
+                current = int(100.0 *
+                              (work_offset + progress * output_type.work) /
+                              total_work)
+                if (current, message) != progress_callback.previous:
+                    print current, message
+                    progress_callback.previous = current, message
+            progress_callback.previous = 0, ''
+        else:
+            progress_callback = None
+
+        write_to_file_or_stdout(getattr(dbwrapper, output_type.method_name),
+                                filepath,
+                                output_type.title,
+                                progress_callback,
+                                comment_char=output_type.comment_char)
+        work_offset += output_type.work
 
     if opts.debug: # print list of relations as Python comments
         for (to_table, to_column), relation in d.relationships.items():
